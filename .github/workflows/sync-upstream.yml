@@ -1,0 +1,77 @@
+name: Sync Upstream
+
+# 自动把 fork 同步到上游默认分支（落后则拉取；本地有独有提交则 merge）
+on:
+  schedule:
+    # 每天 UTC 16:00 ≈ 北京时间 00:00
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork from parent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+          META=$(gh api "repos/${REPO}")
+          IS_FORK=$(echo "$META" | jq -r .fork)
+          if [[ "$IS_FORK" != "true" ]]; then
+            echo "Not a fork, skip."
+            exit 0
+          fi
+
+          PARENT=$(echo "$META" | jq -r .parent.full_name)
+          BRANCH=$(echo "$META" | jq -r .default_branch)
+          UP_BRANCH=$(gh api "repos/${PARENT}" --jq .default_branch)
+
+          echo "Repository : ${REPO} @ ${BRANCH}"
+          echo "Upstream   : ${PARENT} @ ${UP_BRANCH}"
+
+          git clone --branch "${BRANCH}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" work
+          cd work
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${PARENT}.git"
+          git fetch --no-tags upstream "${UP_BRANCH}"
+
+          BEFORE=$(git rev-parse HEAD)
+          BEHIND=$(git rev-list --count "HEAD..upstream/${UP_BRANCH}")
+          AHEAD=$(git rev-list --count "upstream/${UP_BRANCH}..HEAD")
+          echo "behind=${BEHIND} ahead=${AHEAD}"
+
+          if [[ "${BEHIND}" == "0" ]]; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+
+          if [[ "${AHEAD}" == "0" ]]; then
+            git merge --ff-only "upstream/${UP_BRANCH}"
+          else
+            git merge "upstream/${UP_BRANCH}" \
+              -m "chore: sync upstream ${PARENT}@${UP_BRANCH}"
+          fi
+
+          AFTER=$(git rev-parse HEAD)
+          if [[ "${BEFORE}" == "${AFTER}" ]]; then
+            echo "No commit change after merge."
+            exit 0
+          fi
+
+          git push origin "HEAD:${BRANCH}"
+          echo "Synced ${BEFORE:0:7} -> ${AFTER:0:7}"
