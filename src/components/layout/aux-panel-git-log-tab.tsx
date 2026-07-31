@@ -25,6 +25,7 @@ import {
   GitBranchPlus,
   GitCompare,
   Hash,
+  LocateFixed,
   RefreshCw,
   RotateCcw,
   Upload,
@@ -84,7 +85,9 @@ import {
 } from "@/components/ui/command"
 import { Skeleton } from "@/components/ui/skeleton"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
+import { GitLogCommitMessage } from "@/components/layout/git-log-commit-message"
 import { subscribe } from "@/lib/platform"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
@@ -172,6 +175,46 @@ export function addRecentAuthor(recent: string[], author: string): string[] {
 // Drop `author` from the recent list (exact match). Pure.
 export function removeRecentAuthor(recent: string[], author: string): string[] {
   return recent.filter((a) => a !== author)
+}
+
+// The dynamic "current branch" selection. Sent to git VERBATIM as the log's rev
+// argument, so git resolves it per query — the filter follows every checkout
+// (and keeps working on a detached HEAD) without the frontend having to know the
+// branch name. It can never collide with a real ref: git rejects `HEAD` as a
+// local branch name, and git_list_all_branches already drops remote refs
+// containing "HEAD" (e.g. `origin/HEAD`).
+export const HEAD_BRANCH_FILTER = "HEAD"
+
+export function isHeadFilter(branch: string | null): boolean {
+  return branch === HEAD_BRANCH_FILTER
+}
+
+// Whether a branch selection still refers to something this repo can log. Used
+// to drop a restored branch that has since been deleted; the HEAD sentinel is
+// never in the branch list yet is always valid, and `null` is the all-branches
+// view. Pure.
+export function isLiveBranchSelection(
+  branch: string | null,
+  list: GitBranchList
+): boolean {
+  if (branch === null || isHeadFilter(branch)) return true
+  return list.local.includes(branch) || list.remote.includes(branch)
+}
+
+// Reset always targets the CURRENT branch, so it is allowed from the
+// all-branches view, from the HEAD view (which *is* the current branch), or
+// while viewing the current branch by name — but not while viewing a different
+// specific branch. Pure.
+export function canResetFromSelection(
+  currentBranch: string | null,
+  selectedBranch: string | null
+): boolean {
+  if (!currentBranch) return false
+  return (
+    selectedBranch === null ||
+    isHeadFilter(selectedBranch) ||
+    selectedBranch === currentBranch
+  )
 }
 
 // The last branch/author filter, persisted per folder path so the tab reopens on
@@ -656,7 +699,8 @@ function BranchSelector({
 }: {
   branchList: GitBranchList
   currentBranch: string | null
-  // null = the default "all branches" view (git log --all).
+  // null = the default "all branches" view (git log --all);
+  // HEAD_BRANCH_FILTER = the dynamic "whatever branch I'm on" view.
   selectedBranch: string | null
   onBranchChange: (branch: string | null) => void
 }) {
@@ -684,9 +728,12 @@ function BranchSelector({
   )
 
   // Auto-expand the prefix groups leading to the selected (or current) branch
-  // when the popover opens.
+  // when the popover opens. Under the HEAD filter the selection is a sentinel,
+  // not a ref in the tree — seed with the branch it actually resolves to.
   const seedKeys = useMemo(() => {
-    const target = selectedBranch ?? currentBranch
+    const target = isHeadFilter(selectedBranch)
+      ? currentBranch
+      : (selectedBranch ?? currentBranch)
     if (!target) return []
     if (containsBranch(localNodes, target)) {
       return expandedKeysForBranch(localNodes, target)
@@ -707,6 +754,8 @@ function BranchSelector({
     setPopoverOpen(false)
     if (branch !== selectedBranch) onBranchChange(branch)
   }
+
+  const headSelected = isHeadFilter(selectedBranch)
 
   const indentStyle = (depth: number) => ({
     paddingLeft: `${0.5 + depth * 0.75}rem`,
@@ -819,12 +868,36 @@ function BranchSelector({
                 ? "pr-0.5 text-foreground/80 hover:text-foreground"
                 : "pr-2 text-muted-foreground hover:text-foreground/80"
             )}
-            title={selectedBranch ?? t("label")}
+            title={
+              headSelected
+                ? currentBranch
+                  ? t("headHintWithBranch", { branch: currentBranch })
+                  : t("headHint")
+                : (selectedBranch ?? t("label"))
+            }
           >
-            <GitBranch className="size-3.5 shrink-0" />
-            <span className="min-w-0 truncate text-left">
-              {selectedBranch ?? t("label")}
+            {headSelected ? (
+              <LocateFixed className="size-3.5 shrink-0" />
+            ) : (
+              <GitBranch className="size-3.5 shrink-0" />
+            )}
+            <span
+              className={cn(
+                "min-w-0 truncate text-left",
+                // "HEAD" is the label; the resolved branch beside it is the part
+                // that gives when the pill runs out of room.
+                headSelected && "shrink-0"
+              )}
+            >
+              {headSelected ? t("head") : (selectedBranch ?? t("label"))}
             </span>
+            {/* Under the HEAD filter the pill also spells out the branch it
+                currently resolves to, so the view is readable at a glance. */}
+            {headSelected && currentBranch && (
+              <span className="min-w-0 shrink truncate text-xs text-muted-foreground">
+                {currentBranch}
+              </span>
+            )}
             {!selectedBranch && (
               <ChevronDown className="size-3 shrink-0 opacity-50" />
             )}
@@ -844,6 +917,27 @@ function BranchSelector({
             />
             <CommandList>
               <CommandEmpty>{t("noBranches")}</CommandEmpty>
+              {/* Pinned above the branch groups: the dynamic "current branch"
+                  view. It filters by the literal `HEAD` ref, so it follows every
+                  checkout instead of pinning a name. The cmdk value carries both
+                  the sentinel and the branch it resolves to, so typing either
+                  still finds this row in search mode. */}
+              <CommandGroup>
+                <CommandItem
+                  value={`head HEAD ${currentBranch ?? ""}`}
+                  title={t("headHint")}
+                  onSelect={() => handleSelect(HEAD_BRANCH_FILTER)}
+                >
+                  <LocateFixed className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">{t("head")}</span>
+                  {currentBranch && (
+                    <span className="min-w-0 shrink truncate text-[10px] text-muted-foreground">
+                      {currentBranch}
+                    </span>
+                  )}
+                  {headSelected && <Check className="size-3.5 shrink-0" />}
+                </CommandItem>
+              </CommandGroup>
               {branchList.local.length > 0 && (
                 <CommandGroup heading={t("localBranches")}>
                   {isSearching
@@ -1526,17 +1620,14 @@ export function GitLogTab() {
       // A restored/selected branch may no longer exist (deleted since it was
       // last used). Once we have this repo's authoritative branch list, drop it
       // back to the all-branches view and forget it so we don't keep restoring a
-      // dead branch (which would make the first fetch error). Read via refs so
-      // this callback stays keyed only on the folder path — else it'd recreate,
-      // and re-run its effect, on every filter change. Otherwise leave
-      // selectedBranch alone: the default is "all branches" (null) and an
-      // explicit pick is owned by the branch selector / restored per folder.
-      const sel = selectedBranchRef.current
-      if (
-        sel &&
-        !allBranches.local.includes(sel) &&
-        !allBranches.remote.includes(sel)
-      ) {
+      // dead branch (which would make the first fetch error). The HEAD sentinel
+      // is exempt — it is never in the branch list yet always resolves (see
+      // isLiveBranchSelection). Read via refs so this callback stays keyed only
+      // on the folder path — else it'd recreate, and re-run its effect, on every
+      // filter change. Otherwise leave selectedBranch alone: the default is "all
+      // branches" (null) and an explicit pick is owned by the branch selector /
+      // restored per folder.
+      if (!isLiveBranchSelection(selectedBranchRef.current, allBranches)) {
         setSelectedBranch(null)
         saveSelection(path, { branch: null, author: selectedAuthorRef.current })
       }
@@ -1855,15 +1946,13 @@ export function GitLogTab() {
     t,
   ])
 
-  const isResetAllowed = useMemo(() => {
-    // Reset always targets the CURRENT branch. Allow it from the default
-    // "all branches" view (selectedBranch === null) or when viewing the current
-    // branch; only block while viewing a DIFFERENT specific branch.
-    return (
-      !!currentBranch &&
-      (selectedBranch === null || currentBranch === selectedBranch)
-    )
-  }, [currentBranch, selectedBranch])
+  // Reset always targets the CURRENT branch — allowed from the all-branches
+  // view, the HEAD view, or while viewing the current branch by name; blocked
+  // only while viewing a DIFFERENT specific branch (see canResetFromSelection).
+  const isResetAllowed = useMemo(
+    () => canResetFromSelection(currentBranch, selectedBranch),
+    [currentBranch, selectedBranch]
+  )
 
   const handleOpenResetDialog = useCallback((entry: GitLogEntry) => {
     setResetMode("mixed")
@@ -1955,6 +2044,53 @@ export function GitLogTab() {
       void fetchLog({ inline: true })
     }
   }, [refreshBranches, refreshCurrentUser, fetchLog])
+
+  // Keep the HEAD filter honest across checkouts made OUTSIDE the app. In-app
+  // branch switches already refresh through folder://git-branch-changed; a
+  // `git checkout` in a terminal emits nothing, so we ride the active folder's
+  // existing git-HEAD poll (app-workspace-context, every ~10s) and refresh when
+  // it reports a different HEAD. Read from `gitHeads` — written ONLY by that
+  // poll — rather than `branches`, which fetchFolders also seeds from a possibly
+  // stale DB column, and which collapses "detached" and "not polled yet" into
+  // the same null.
+  const polledHead = useAppWorkspaceStore((s) =>
+    folder ? (s.gitHeads.get(folder.id) ?? null) : null
+  )
+  // What the poll last saw HEAD pointing at: the branch name, or the commit when
+  // detached (a detached HEAD has no name, so branch↔detached and
+  // detached→another-commit checkouts would otherwise be invisible). null while
+  // the folder is unpolled / not a repo — never compared against.
+  const polledHeadSignature =
+    polledHead?.is_repo === true
+      ? (polledHead.branch ?? polledHead.short_sha)
+      : null
+  const lastPolledHeadRef = useRef<{
+    folderId: number
+    signature: string | null
+  } | null>(null)
+  useEffect(() => {
+    const folderId = folder?.id ?? null
+    if (folderId == null) {
+      lastPolledHeadRef.current = null
+      return
+    }
+    const prev = lastPolledHeadRef.current
+    lastPolledHeadRef.current = { folderId, signature: polledHeadSignature }
+    // First reading for this folder (mount / folder switch): there is nothing to
+    // compare against, and the folder's own load already fetched current state.
+    if (!prev || prev.folderId !== folderId) return
+    if (
+      polledHeadSignature === null ||
+      prev.signature === polledHeadSignature
+    ) {
+      return
+    }
+    // Only the HEAD view is dynamic — every other selection pins a fixed ref.
+    // Recording above stays unconditional so a filter change never compares
+    // against a signature from several checkouts ago.
+    if (folderStale || !isHeadFilter(selectedBranch)) return
+    onGitEventRef.current()
+  }, [folder?.id, polledHeadSignature, folderStale, selectedBranch])
 
   // Refresh branches & log on branch change, commit, or push. Keyed on the
   // numeric folder id (not the folder object) so a same-id object replacement
@@ -2296,16 +2432,12 @@ export function GitLogTab() {
                                         </time>
                                       </span>
                                     </div>
-                                    <div className="group/msg relative rounded-lg border border-border/60 bg-muted/20 p-2.5">
-                                      <p className="text-xs whitespace-pre-wrap break-words pr-6">
-                                        {entry.message}
-                                      </p>
-                                      <CommitCopyButton
-                                        className="absolute top-1.5 right-1.5 size-5 opacity-0 transition-opacity group-hover/msg:opacity-100 group-focus-within/msg:opacity-100"
-                                        hash={entry.message}
-                                        title={t("copyMessage")}
-                                      />
-                                    </div>
+                                    {/* Long release messages are capped with a
+                                        Show more / Show less toggle so the file
+                                        tree below stays reachable. */}
+                                    <GitLogCommitMessage
+                                      message={entry.message}
+                                    />
                                     {/* File changes load lazily on expand (the
                                         list query runs with withFiles=false).
                                         CommitFilesTree renders its own "Files"
