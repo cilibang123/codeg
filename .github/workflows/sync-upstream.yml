@@ -1,6 +1,8 @@
 name: Sync Upstream
 
-# 自动把 fork 同步到上游默认分支（落后则拉取；本地有独有提交则 merge）
+# 自动把 fork 同步到上游默认分支
+# - 默认用 GITHUB_TOKEN（上游若改了 .github/workflows 可能推送失败）
+# - 建议在仓库 Secrets 配置 SYNC_TOKEN（classic PAT，勾选 repo + workflow）
 on:
   schedule:
     # 每天 UTC 16:00 ≈ 北京时间 00:00
@@ -21,7 +23,8 @@ jobs:
     steps:
       - name: Sync fork from parent
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 优先使用带 workflow 权限的 PAT，否则回退 GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN != '' && secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -39,6 +42,11 @@ jobs:
 
           echo "Repository : ${REPO} @ ${BRANCH}"
           echo "Upstream   : ${PARENT} @ ${UP_BRANCH}"
+          if [[ "${{ secrets.SYNC_TOKEN != '' }}" == "true" ]]; then
+            echo "Auth       : SYNC_TOKEN (supports workflow file updates)"
+          else
+            echo "Auth       : GITHUB_TOKEN (cannot push changes to .github/workflows/*)"
+          fi
 
           git clone --branch "${BRANCH}" \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" work
@@ -73,5 +81,10 @@ jobs:
             exit 0
           fi
 
-          git push origin "HEAD:${BRANCH}"
-          echo "Synced ${BEFORE:0:7} -> ${AFTER:0:7}"
+          if git push origin "HEAD:${BRANCH}"; then
+            echo "Synced ${BEFORE:0:7} -> ${AFTER:0:7}"
+            exit 0
+          fi
+
+          echo "::error::Push failed. If the log mentions workflow permission, add a classic PAT with scopes 'repo' + 'workflow' as repository secret SYNC_TOKEN, then re-run."
+          exit 1
