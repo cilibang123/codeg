@@ -90,6 +90,26 @@ pub struct RestartParams {
     pub note: Option<String>,
 }
 
+/// Plan a to-do task's start. `scheduledAt` is RFC 3339; absent or null clears
+/// the plan.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleParams {
+    pub id: i32,
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
+}
+
+/// A cancel that may carry the user's reason for stopping the task. Like
+/// `RestartParams`, the note defaults so `{ "id": 1 }` still deserializes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelParams {
+    pub id: i32,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeParams {
@@ -264,6 +284,16 @@ pub async fn work_task_requeue(
     Ok(Json(()))
 }
 
+pub async fn work_task_schedule(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ScheduleParams>,
+) -> Result<Json<()>, AppCommandError> {
+    core::work_task_schedule_core(&state.emitter, &state.db, params.id, params.scheduled_at)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(Json(()))
+}
+
 pub async fn work_task_return(
     Json(params): Json<ReturnParams>,
 ) -> Result<Json<()>, AppCommandError> {
@@ -274,9 +304,9 @@ pub async fn work_task_return(
 }
 
 pub async fn work_task_cancel(
-    Json(params): Json<IdParams>,
+    Json(params): Json<CancelParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    core::work_task_cancel_core(params.id)
+    core::work_task_cancel_core(params.id, params.reason)
         .await
         .map_err(AppCommandError::from)?;
     Ok(Json(()))
