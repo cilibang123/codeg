@@ -63,6 +63,7 @@ import {
   FolderSelect,
   type FolderSelectOption,
 } from "@/components/shared/folder-select"
+import { ForgeBetaBadge } from "@/components/forge/forge-beta-badge"
 import { OPEN_FORGE_SETTINGS_EVENT } from "@/components/forge/forge-chrome-actions"
 import { ForgeIssueRowItem } from "@/components/forge/forge-issue-row"
 import { ForgeSettingsDialog } from "@/components/forge/forge-settings-dialog"
@@ -108,6 +109,18 @@ import { useForgeRefreshStore } from "@/stores/forge-refresh-store"
 
 const WORK_TASK_CHANGED_EVENT = "task://changed"
 const FOLDER_STORAGE_KEY = "forge:folderId"
+
+/** Separates label names inside the counts scope key, so that a label carrying
+ *  the outer `:` cannot make two different filter sets read as one scope.
+ *
+ *  Built at runtime rather than written as an escape sequence, because this
+ *  file is where the alternative was found in the wild: the escape had landed
+ *  as a real NUL byte, and nothing complained. It compiled, the tests passed,
+ *  and git kept diffing it as text — git sniffs only the first few thousand
+ *  bytes for NUL, and this one sat well past that. What it did break was
+ *  search: grep and rg classify the whole file as binary and return no
+ *  matches, so every symbol in here read as one that does not exist. */
+const LABEL_SCOPE_SEP = String.fromCharCode(0)
 
 /** Must mirror `NO_ACCOUNT_I18N_KEY` in src-tauri/src/forge/mod.rs. The key —
  *  not the error `code` — is the discriminator: `configuration_missing` is a
@@ -238,7 +251,7 @@ export function repoWebUrl(remote: ForgeRemote): string {
 
 export function ForgePageTitle() {
   const t = useTranslations("Forge")
-  return <WorkbenchPageTitle title={t("title")} />
+  return <WorkbenchPageTitle title={t("title")} badge={<ForgeBetaBadge />} />
 }
 
 function loadStoredFolderId(): number | null {
@@ -369,7 +382,7 @@ export function ForgePage() {
   const listScope = `${effectiveFolderId}:${tab}`
   /** Which RESULT SET the badges count — see [`TabCounts`]. No tab, no page,
    *  no order: none of the three can change either number. */
-  const countsScope = `${effectiveFolderId}:${stateFilter}:${assignedMe}:${labelFilter.join(" ")}:${search}`
+  const countsScope = `${effectiveFolderId}:${stateFilter}:${assignedMe}:${labelFilter.join(LABEL_SCOPE_SEP)}:${search}`
   /** The only tab a probe is ever spent on. */
   const otherTab: ForgeTab = tab === "issues" ? "prs" : "issues"
 

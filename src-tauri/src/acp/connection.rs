@@ -6848,7 +6848,28 @@ fn recovers_load_failure_locally(agent_type: AgentType, classified: Option<&'sta
 /// (`UserMessageChunk`, `Plan`, `*ModeUpdate`, `ConfigOptionUpdate`,
 /// `SessionInfoUpdate`, `AvailableCommandsUpdate`, `UsageUpdate`) do not
 /// count.
-fn is_agent_output_update(update: &SessionUpdate) -> bool {
+///
+/// `agent_type` is here for pi, whose lifecycle announcements ride the
+/// `agent_message_chunk` channel (issue #525). Those chunks are not rendered, so
+/// counting them as output would let a status-only turn end BOTH blank and
+/// "successful" — the exact silent-blank-turn failure this predicate exists to
+/// catch. Asking [`pi_message_chunk_route`] — the same classifier the renderer
+/// uses — is what keeps the two from disagreeing; a dropped or retry chunk falls
+/// through to `saw_metadata_update`, so such a turn reports
+/// `turn_failed_empty_metadata` ("pi sent only status updates this turn and no
+/// reply"). In practice this is a backstop rather than a common path: pi's retry
+/// and compaction both continue into prose or tools.
+fn is_agent_output_update(agent_type: AgentType, update: &SessionUpdate) -> bool {
+    if let SessionUpdate::AgentMessageChunk(ContentChunk {
+        content: ContentBlock::Text(text),
+        meta,
+        ..
+    }) = update
+    {
+        if pi_message_chunk_route(agent_type, &text.text, meta.as_ref()) != PiChunkRoute::Prose {
+            return false;
+        }
+    }
     matches!(
         update,
         SessionUpdate::AgentMessageChunk(_)
@@ -6886,7 +6907,7 @@ async fn handle_turn_notification(
 ) {
     let should_poll_now =
         track_terminal_tool_calls(agent_type, &notif.update, tracked_terminal_tool_calls);
-    probe.note_update(&notif.update);
+    probe.note_update(agent_type, &notif.update);
     // Custom agents have no store of their own to parse later.
     record_transcript_update(agent_type, &session_id.0, &notif.update);
     emit_conversation_update(
@@ -7009,8 +7030,8 @@ impl TurnOutputProbe {
         }
     }
 
-    fn note_update(&mut self, update: &SessionUpdate) {
-        if is_agent_output_update(update) {
+    fn note_update(&mut self, agent_type: AgentType, update: &SessionUpdate) {
+        if is_agent_output_update(agent_type, update) {
             self.saw_agent_output = true;
         } else {
             self.saw_metadata_update = true;
@@ -8618,6 +8639,276 @@ fn grok_live_tool_output(
     // finished MCP call — e.g. the `delegate_to_agent` ack carrying
     // `task_id=…` — would surface no output at all.
     grok_mcp_output_text(raw)
+}
+
+/// Resolve the live `raw_output` string for a pi tool call.
+///
+/// pi-acp hands ACP the pi tool result VERBATIM as `rawOutput` — the MCP-shaped
+/// envelope `{"content":[{"type":"text","text":…}]}` — while putting that very
+/// same text, already flattened, on the `content[]` channel
+/// (`toolResultToText`; both `tool_execution_update` and `tool_execution_end`
+/// emit the pair). Stringifying the envelope shadows the clean text, because the
+/// live renderer's `raw_output_chunks` win over `content`
+/// (`conversation-runtime-store.ts`), and nothing downstream unwraps that shape
+/// (`commandOutputFromJsonString` bails on a `content` array) — so a finished
+/// `bash` painted its terminal body with the JSON source string.
+///
+/// Same parity rule as Grok (see `grok_live_tool_output`): whenever `content`
+/// carries anything, it IS pi-acp's own flattening of this very result — emit
+/// `None` and let it render (that also covers the `details.diff` / `stdout` /
+/// `output` shapes `toolResultToText` flattens, which the envelope alone does
+/// not reach). Only with no `content` is the envelope unwrapped, through the
+/// SAME flattener the history parser uses so both surfaces show one string.
+///
+/// pi's empty opening announcement is excluded up front — emitting anything for
+/// it would strand a placeholder chunk over the whole call (see
+/// `pi_result_is_empty_announcement`). Every OTHER result that carries something
+/// but whose block array holds no text still stringifies exactly as before:
+/// `toolResultToText` reaches `details.diff`, `stdout`/`stderr` and `output` that
+/// the block array alone does not, so dropping those would lose a real result.
+///
+/// (pi ≥0.0.33 routes `bash` through `_meta.terminal_*` and sends no `rawOutput`
+/// for it at all — see `pi_bash_terminal_chunk`. This is the path every OTHER pi
+/// tool takes, and the one `bash` itself takes on earlier pi-acp builds.)
+fn pi_live_tool_output(
+    content: &Option<String>,
+    raw_output: &Option<serde_json::Value>,
+) -> Option<String> {
+    let raw = raw_output.as_ref()?;
+    if pi_result_is_empty_announcement(raw) {
+        return None;
+    }
+    if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+        return None;
+    }
+    raw.get("content")
+        .and_then(crate::parsers::pi::tool_result_content_text)
+        .or_else(|| json_value_to_text(raw_output))
+        .map(|text| structurize_live_output(&text))
+}
+
+/// Is this `rawOutput` pi's "I have started, and have nothing yet" announcement —
+/// literally `{"content": []}`?
+///
+/// pi's bash tool fires `onUpdate({content: [], details: undefined})` before the
+/// process writes a byte (`bash.js`), so this is the opening frame of EVERY pi
+/// command. Both channels then carry noise: `rawOutput` is the empty envelope,
+/// and pi-acp — with no text, diff, stdout or stderr to flatten — falls back to
+/// `JSON.stringify(result, null, 2)` for `content[]` (`toolResultToText`), which
+/// puts a literal `{\n  "content": []\n}` in the terminal card until the first
+/// line of real output arrives. Worse, stringifying the envelope into
+/// `raw_output` seeds it as the call's chunk, and since every later frame prefers
+/// `content` and emits `None` — which the reducer treats as "keep the previous
+/// chunks" (`acp-connections-context.tsx`) — that placeholder would outrank the
+/// real output for the rest of the call.
+///
+/// So both channels are suppressed for this frame, and ONLY for this frame: the
+/// predicate is deliberately the narrowest thing that identifies it — an empty
+/// `content` array and no other non-null member. Any richer result (a diff,
+/// `stdout`/`stderr`, an exit code, a truncation record) is something
+/// `toolResultToText` may have flattened into real text, so it is left alone even
+/// when its block array is empty. Keyed off the STRUCTURED payload, never off the
+/// rendered string, so a command whose own output looks like an empty envelope is
+/// untouched.
+fn pi_result_is_empty_announcement(raw_output: &serde_json::Value) -> bool {
+    let Some(obj) = raw_output.as_object() else {
+        return false;
+    };
+    obj.get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| blocks.is_empty())
+        && obj
+            .iter()
+            .all(|(key, value)| key == "content" || value.is_null())
+}
+
+/// pi-gated wrapper for the `content` channel: see `pi_result_is_empty_announcement`.
+fn pi_result_content_is_stringify_noise(
+    agent_type: AgentType,
+    raw_output: &Option<serde_json::Value>,
+) -> bool {
+    matches!(agent_type, AgentType::Pi)
+        && raw_output
+            .as_ref()
+            .is_some_and(pi_result_is_empty_announcement)
+}
+
+/// What a pi `agent_message_chunk` actually IS (issue #525).
+///
+/// pi-acp puts the assistant's prose AND its own lifecycle announcements on the
+/// same `agent_message_chunk` channel, so a caffeinate extension's notify lands
+/// spliced into the reply: `你好。有什么需要我帮你处理?Released pi-caffeinate
+/// (agent finished).` See [`pi_message_chunk_route`] for the full inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiChunkRoute {
+    /// The agent's own words — pi's `message_update` / `text_delta`. Renders as
+    /// today's `ContentDelta`. This is what EVERY other agent's chunk resolves
+    /// to, since the classifier is pi-gated.
+    Prose,
+    /// A pi-acp lifecycle announcement with nothing downstream needs it.
+    Drop,
+    /// pi is auto-retrying the model call. Routed to the shared retry banner
+    /// (`AcpEvent::TurnRetrying`) instead of the prose stream. The numbers are
+    /// pi's own, recovered from the sentence it formats them into; all three are
+    /// `None` for pi-acp's shapeless `"Retrying..."` fallback.
+    Retrying {
+        attempt: Option<u32>,
+        max: Option<u32>,
+        delay_ms: Option<u64>,
+    },
+}
+
+/// Tell a pi `agent_message_chunk` that is the ASSISTANT SPEAKING from one that
+/// is pi-acp ANNOUNCING SOMETHING (issue #525).
+///
+/// Real prose reaches this channel from exactly one place: pi-acp's
+/// `message_update` arm, for `assistantMessageEvent.type === "text_delta"`.
+/// Everything below is pi-acp synthesizing a sentence out of a pi RPC lifecycle
+/// event and emitting it on that SAME channel, where the live store appends it
+/// into whatever message is open — which is the whole bug:
+///
+/// | pi-acp `dist/index.js` | text | marker |
+/// |---|---|---|
+/// | L1265 `extension_ui_request` / `notify`   | the extension's own message | `_meta.piAcp.notify` |
+/// | L1169 `auto_retry_start`                  | `Retrying (attempt N/M, waiting Ss)...` | — |
+/// | L1176 `auto_retry_end`                    | `Retry finished, resuming.` | — |
+/// | L1183 `auto_compaction_start`             | `Context nearing limit, running automatic compaction...` | — |
+/// | L1193 `auto_compaction_end`               | `Automatic compaction finished; …` | — |
+/// | L834  `prompt()` queue                    | `Queued message (position N).` | — |
+/// | L1222 `agent_settled` queue               | `Starting queued message. (N remaining)` | — |
+/// | L860  `cancel()` queue                    | `Cleared queued prompts.` | — |
+///
+/// The notify marker is read FIRST and wins outright, because that text is
+/// arbitrary extension content — a pi extension can notify anything, including
+/// something that reads exactly like prose, so the structured marker is the only
+/// trustworthy handle on it. The other seven carry no marker at all, and pi-acp
+/// offers no alternative channel for them, so they are matched as LITERALS.
+/// Three things keep that honest: the whole classifier is gated on
+/// `AgentType::Pi`; every rule matches the WHOLE trimmed chunk, never a
+/// substring; and the adapter version is pinned in `registry.rs`, so a bump is
+/// the natural place to re-check these strings. A false positive would need the
+/// model to emit one of these exact sentences as an entire standalone delta, and
+/// would cost one dropped delta — not a corrupted message.
+///
+/// Two families deliberately stay `Prose`, and must:
+///
+/// - **Slash-command replies** (pi-acp L2080+: `/compact`, `/session`, `/name`,
+///   `/export`, `/follow-up`, `/steering`, `/changelog`) and the startup prelude
+///   (`sendStartupInfoIfPending`). The user ASKED for those; they ride the same
+///   channel and match no rule here, which is exactly the point of matching
+///   whole literals rather than sniffing for "status-looking" text.
+/// - **`Pi <method> UI request is not supported in ACP yet; cancelling it.`**
+///   (L1257). pi asked the user for input and pi-acp auto-cancelled it — a rare,
+///   actionable failure with no better home today. Dropping it would hide the
+///   reason a turn went sideways, which is worse than the noise this fixes.
+///
+/// Used by BOTH the renderer (`emit_conversation_update`) and the empty-turn
+/// probe (`is_agent_output_update`), so the two can never disagree about whether
+/// a chunk was output — a status-only turn must not render blank AND report
+/// success.
+fn pi_message_chunk_route(
+    agent_type: AgentType,
+    text: &str,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> PiChunkRoute {
+    if agent_type != AgentType::Pi {
+        return PiChunkRoute::Prose;
+    }
+    // A pi extension's `ui.notify()`. pi's own semantics for it are a transient
+    // toast (`rpc-mode.js`: "Fire and forget - no response needed"), never
+    // conversation — so it is dropped at every level (`info` / `warning` /
+    // `error`). Keyed off the marker alone: the message is the extension's, and
+    // matching it as text would be matching arbitrary user content.
+    if meta.is_some_and(|meta| {
+        meta.get("piAcp")
+            .and_then(|pi| pi.get("notify"))
+            .is_some_and(serde_json::Value::is_object)
+    }) {
+        return PiChunkRoute::Drop;
+    }
+    let text = text.trim();
+    match text {
+        // `auto_retry_end`. No event of its own: the banner clears at the next
+        // tool call / plan update / turn boundary, exactly as codex's does.
+        "Retry finished, resuming." => PiChunkRoute::Drop,
+        // `formatAutoRetryMessage`'s fallback, when pi's event carried no usable
+        // attempt / maxAttempts / delayMs.
+        "Retrying..." => PiChunkRoute::Retrying {
+            attempt: None,
+            max: None,
+            delay_ms: None,
+        },
+        // Compaction. Dropped rather than rendered as the shared
+        // `_meta.contextCompaction` card: a tool call synthesized at the END of a
+        // turn would land after the reply, and `SessionState`'s "final assistant
+        // text" is the text FOLLOWING the last tool call — so the card would
+        // silently blank the delegation result / work-task summary. Restoring the
+        // card is a follow-up, gated on teaching that extraction to skip
+        // compaction refs (which codex and grok need too).
+        "Context nearing limit, running automatic compaction..."
+        | "Automatic compaction finished; context was summarized to continue the session." => {
+            PiChunkRoute::Drop
+        }
+        // pi-acp's own prompt queue. codeg's turn gate normally makes this
+        // unreachable (`manager.rs` rejects a concurrent prompt), so all three
+        // are handled defensively and together — one of them showing up alone
+        // would be the odd one out.
+        "Cleared queued prompts." => PiChunkRoute::Drop,
+        _ => {
+            if let Some((attempt, max, delay_ms)) = pi_parse_retry_announcement(text) {
+                PiChunkRoute::Retrying {
+                    attempt: Some(attempt),
+                    max: Some(max),
+                    delay_ms: Some(delay_ms),
+                }
+            } else if pi_is_queue_announcement(text) {
+                PiChunkRoute::Drop
+            } else {
+                PiChunkRoute::Prose
+            }
+        }
+    }
+}
+
+/// Recover `(attempt, max, delay_ms)` from `Retrying (attempt 1/3, waiting 2s)...`
+/// — pi-acp's `formatAutoRetryMessage`, which is the only place codeg can reach
+/// these numbers: pi sends them structured to pi-acp, which formats them into a
+/// sentence and forwards nothing else.
+///
+/// Worth recovering rather than shipping the sentence as the banner's message,
+/// because the banner already has localized slots for exactly this data
+/// (`claudeApiRetry.retryingWithMax` / `nextRetryIn`) — so a zh-CN user reads
+/// `正在重试 1/3，2.0 秒后重试` instead of an English sentence with a Chinese
+/// suffix bolted on.
+///
+/// Parsed by hand rather than by regex: the shape is fixed, and every field is
+/// re-validated (`{n}/{n}`, `{n}s`, nothing left over), so a sentence that merely
+/// starts the same way falls through to `Prose` instead of half-matching.
+fn pi_parse_retry_announcement(text: &str) -> Option<(u32, u32, u64)> {
+    let body = text
+        .strip_prefix("Retrying (attempt ")?
+        .strip_suffix("s)...")?;
+    let (attempts, delay_seconds) = body.split_once(", waiting ")?;
+    let (attempt, max) = attempts.split_once('/')?;
+    Some((
+        attempt.parse().ok()?,
+        max.parse().ok()?,
+        delay_seconds.parse::<u64>().ok()?.checked_mul(1000)?,
+    ))
+}
+
+/// `Queued message (position N).` / `Starting queued message. (N remaining)` —
+/// the two pi-acp queue announcements that carry an interpolated count (the
+/// third, `Cleared queued prompts.`, is a plain literal handled by the caller).
+fn pi_is_queue_announcement(text: &str) -> bool {
+    let counted = text
+        .strip_prefix("Queued message (position ")
+        .and_then(|rest| rest.strip_suffix(")."))
+        .or_else(|| {
+            text.strip_prefix("Starting queued message. (")
+                .and_then(|rest| rest.strip_suffix(" remaining)"))
+        });
+    counted.is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Grok wraps every MCP tool invocation in a generic `use_tool` envelope whose
@@ -10513,20 +10804,52 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
-                // Claude subagent chunks (claude-agent-acp ≥0.63 with the
-                // `subagent-transcript` capability) are NOT suppressed: they
-                // emit with their parent id so the frontend can route them
-                // into the live Agent capsule.
-                let parent_tool_use_id = claude_chunk_parent_tool_use_id(agent_type, meta.as_ref());
-                emit_with_state(
-                    state,
-                    emitter,
-                    AcpEvent::ContentDelta {
-                        text: text.text,
-                        parent_tool_use_id,
-                    },
-                )
-                .await;
+                // pi-acp announces its own lifecycle (extension notifies, auto
+                // retry, compaction, prompt queue) on this same prose channel,
+                // where it splices into the reply — issue #525. Classify before
+                // emitting; `Prose` is every other agent's only outcome.
+                match pi_message_chunk_route(agent_type, &text.text, meta.as_ref()) {
+                    PiChunkRoute::Drop => {}
+                    PiChunkRoute::Retrying {
+                        attempt,
+                        max,
+                        delay_ms,
+                    } => {
+                        // The shared retry banner, not the transcript. `message`
+                        // is empty on purpose: pi forwards no error text, and the
+                        // banner renders its own localized line from the numbers
+                        // (see `AcpEvent::TurnRetrying`).
+                        emit_with_state(
+                            state,
+                            emitter,
+                            AcpEvent::TurnRetrying {
+                                message: String::new(),
+                                error_status: None,
+                                attempt,
+                                max_retries: max,
+                                retry_delay_ms: delay_ms,
+                            },
+                        )
+                        .await;
+                    }
+                    PiChunkRoute::Prose => {
+                        // Claude subagent chunks (claude-agent-acp ≥0.63 with the
+                        // `subagent-transcript` capability) are NOT suppressed: they
+                        // emit with their parent id so the frontend can route them
+                        // into the live Agent capsule.
+                        let parent_tool_use_id =
+                            claude_chunk_parent_tool_use_id(agent_type, meta.as_ref());
+                        emit_with_state(
+                            state,
+                            emitter,
+                            AcpEvent::ContentDelta {
+                                text: text.text,
+                                parent_tool_use_id,
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
         }
         SessionUpdate::AgentMessageChunk(_) => {
@@ -10635,7 +10958,10 @@ async fn emit_conversation_update(
             };
             let content =
                 serialize_tool_call_content(content_blocks, synthesized_edit.is_none())
-                    .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
+                    .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
+                    // pi announces a command with an empty result, which pi-acp
+                    // renders as JSON source (see fn doc).
+                    .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output));
             let images = extract_tool_call_images(content_blocks);
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
@@ -10650,6 +10976,11 @@ async fn emit_conversation_update(
                 // Grok's structured rawOutput would shadow `content` and render
                 // empty; take the parity path (see grok_live_tool_output).
                 grok_live_tool_output(&content, &tc.raw_output)
+            } else if matches!(agent_type, AgentType::Pi) {
+                // pi's rawOutput is the MCP envelope around the SAME text
+                // `content` already carries; shipping it shadows the clean text
+                // with JSON source (see pi_live_tool_output).
+                pi_live_tool_output(&content, &tc.raw_output)
             } else {
                 json_value_to_text(&tc.raw_output)
                     .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
@@ -10828,7 +11159,12 @@ async fn emit_conversation_update(
             };
             let content = content_blocks
                 .and_then(|c| serialize_tool_call_content(c, synthesized_edit.is_none()))
-                .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
+                .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
+                // Symmetric with the ToolCall arm — and the arm that matters:
+                // pi's empty opening frame is a `tool_call_update`.
+                .filter(|_| {
+                    !pi_result_content_is_stringify_noise(agent_type, &tcu.fields.raw_output)
+                });
             let images = content_blocks.and_then(extract_tool_call_images);
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
@@ -10846,6 +11182,10 @@ async fn emit_conversation_update(
                 // Grok's structured rawOutput would shadow `content` and render
                 // empty; take the parity path (see grok_live_tool_output).
                 grok_live_tool_output(&content, &tcu.fields.raw_output)
+            } else if matches!(agent_type, AgentType::Pi) {
+                // Symmetric with the ToolCall arm — and the arm that matters:
+                // pi delivers the result on the update (see pi_live_tool_output).
+                pi_live_tool_output(&content, &tcu.fields.raw_output)
             } else {
                 json_value_to_text(&tcu.fields.raw_output)
                     .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
@@ -10865,8 +11205,10 @@ async fn emit_conversation_update(
             // deliberately BYPASSES `raw_output_cache`: the cache diffs cumulative
             // snapshots, while pi already sends deltas, which is exactly why
             // `emit_terminal_output_update` bypasses it too. pi never sends
-            // `rawOutput` for these calls, so the branch above resolved to
-            // `(None, None)` and nothing is being overwritten.
+            // `rawOutput` for a `_meta`-hosted call, so the branch above resolved
+            // to `(None, None)` and nothing is being overwritten. (Older pi-acp
+            // has no `_meta` channel at all: there `bash` streams like any other
+            // tool and `pi_live_tool_output` above is what carries its output.)
             let (raw_output, raw_output_append) = match pi_bash_terminal_chunk(
                 agent_type,
                 tcu.meta.as_ref(),
@@ -11163,6 +11505,10 @@ async fn emit_conversation_update(
                     AcpEvent::TurnRetrying {
                         message,
                         error_status,
+                        // codex reports no retry counters — only pi does.
+                        attempt: None,
+                        max_retries: None,
+                        retry_delay_ms: None,
                     },
                 )
                 .await;
@@ -13758,13 +14104,17 @@ mod tests {
         use sacp::schema::{ContentChunk, Plan};
 
         let mut probe = TurnOutputProbe::new(0);
-        probe.note_update(&SessionUpdate::Plan(Plan::new(Vec::new())));
+        probe.note_update(
+            AgentType::ClaudeCode,
+            &SessionUpdate::Plan(Plan::new(Vec::new())),
+        );
         assert!(!probe.saw_agent_output, "Plan is not agent output");
         assert!(probe.saw_metadata_update);
 
-        probe.note_update(&SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            "hi".into(),
-        )));
+        probe.note_update(
+            AgentType::ClaudeCode,
+            &SessionUpdate::AgentMessageChunk(ContentChunk::new("hi".into())),
+        );
         assert!(probe.saw_agent_output);
     }
 
@@ -15320,6 +15670,662 @@ mod tests {
             "another agent's identically-named meta must not stream: {raw_output:?}"
         );
         assert!(cb.pi_terminal_calls.is_empty());
+    }
+
+    /// A pi `bash` that does NOT ride the `_meta` channel (every pi-acp build
+    /// before the terminal bridge — and every non-bash pi tool on all of them)
+    /// reports its result twice: flattened into `content[]`, and verbatim as the
+    /// MCP envelope in `rawOutput`. Regression: the envelope was stringified into
+    /// `raw_output`, which WINS over `content` in the live store, so the terminal
+    /// card printed `{"content":[{"text":"$ next build…","type":"text"}]}`.
+    #[tokio::test]
+    async fn pi_tool_result_envelope_does_not_shadow_content() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (content, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_fb7",
+                "status": "completed",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "$ next build\n✓ Compiled\n"},
+                }],
+                "rawOutput": {
+                    "content": [{"type": "text", "text": "$ next build\n✓ Compiled\n"}],
+                },
+            }),
+        )
+        .await;
+
+        assert!(
+            raw_output.is_none(),
+            "the envelope is a second copy of `content` — shipping it renders the \
+             JSON source as the terminal body: {raw_output:?}"
+        );
+        assert_eq!(
+            content.as_deref(),
+            Some("$ next build\n✓ Compiled\n"),
+            "the clean content channel carries the command output"
+        );
+    }
+
+    /// Sequence guard for the whole command, not one frame in isolation.
+    ///
+    /// pi's bash tool fires `onUpdate({content: []})` before the process writes a
+    /// byte, so frame 1 of EVERY command is the empty envelope — and pi-acp, with
+    /// nothing to flatten, puts its own `JSON.stringify(result)` on `content[]`.
+    /// Emitting either one poisons the card: the stringified `{"content":[]}`
+    /// becomes the tool call's raw-output chunk, every later frame prefers
+    /// `content` and emits `None`, the reducer keeps the last chunks, and the
+    /// chunk outranks `content` — so the finished build would render
+    /// `{"content":[]}` instead of its log.
+    #[tokio::test]
+    async fn pi_empty_opening_frame_never_outranks_the_real_output() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (content, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_fb7",
+                "status": "in_progress",
+                // pi-acp's stringify fallback over the empty envelope, verbatim.
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "{\n  \"content\": []\n}"},
+                }],
+                "rawOutput": {"content": []},
+            }),
+        )
+        .await;
+        assert!(
+            raw_output.is_none(),
+            "the empty envelope must not be seeded as a chunk — it would outrank \
+             every later frame's content: {raw_output:?}"
+        );
+        assert!(
+            content.is_none(),
+            "pi-acp's JSON.stringify fallback is not command output: {content:?}"
+        );
+
+        // Frame 2 — the real result, on the SAME tool call id.
+        let (content, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_fb7",
+                "status": "completed",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "$ next build\n✓ Compiled\n"},
+                }],
+                "rawOutput": {"content": [{"type": "text", "text": "$ next build\n✓ Compiled\n"}]},
+            }),
+        )
+        .await;
+        assert_eq!(
+            content.as_deref(),
+            Some("$ next build\n✓ Compiled\n"),
+            "the command output reaches the card"
+        );
+        assert!(
+            raw_output.is_none(),
+            "and nothing is left in the chunk stream to shadow it: {raw_output:?}"
+        );
+    }
+
+    /// A frame whose envelope is empty because pi has produced nothing yet must
+    /// not fall through to the stringify branch even without a `content` channel.
+    #[tokio::test]
+    async fn pi_empty_envelope_is_recognized_by_shape_not_by_yielding_text() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_fb7",
+                "status": "in_progress",
+                "rawOutput": {"content": []},
+            }),
+        )
+        .await;
+        assert!(raw_output.is_none(), "{raw_output:?}");
+    }
+
+    /// The suppression must catch ONLY pi's literal `{"content":[]}` opening
+    /// announcement. `toolResultToText` also flattens `details.diff`, `stdout` /
+    /// `stderr` (with the exit code appended) and `output` from BOTH the result
+    /// and its `details` — every one of those reaches real text that the block
+    /// array alone does not, so an empty block array is not by itself evidence
+    /// that pi had nothing to say. Anything else it cannot flatten it dumps as
+    /// JSON, which is ugly but still carries the result, so that is kept too.
+    #[tokio::test]
+    async fn only_pis_empty_opening_announcement_counts_as_noise() {
+        // (label, rawOutput, the text pi-acp's `toolResultToText` flattens)
+        let real_results = [
+            (
+                "details.diff",
+                serde_json::json!({"content": [], "details": {"diff": "--- a\n+++ b\n+line\n"}}),
+                "--- a\n+++ b\n+line\n",
+            ),
+            (
+                "details.stdout + exitCode",
+                serde_json::json!({"content": [], "details": {"stdout": "build succeeded", "exitCode": 0}}),
+                "build succeeded\n\nexit code: 0",
+            ),
+            (
+                "top-level stdout",
+                serde_json::json!({"content": [], "stdout": "ok"}),
+                "ok",
+            ),
+            (
+                "details.output",
+                serde_json::json!({"content": [], "details": {"output": "from details"}}),
+                "from details",
+            ),
+            (
+                "top-level output",
+                serde_json::json!({"content": [], "output": "from result"}),
+                "from result",
+            ),
+            (
+                "stderr + exitCode",
+                serde_json::json!({"content": [], "details": {"stderr": "boom", "exitCode": 3}}),
+                "stderr:\nboom\n\nexit code: 3",
+            ),
+            (
+                // Nothing flattenable: pi-acp dumps the JSON. Ugly, but it is the
+                // result — the exit code would be lost if we called it noise.
+                "exit-code-only stringify fallback",
+                serde_json::json!({"content": [], "details": {"exitCode": 3}}),
+                "{\n  \"content\": [],\n  \"details\": {\n    \"exitCode\": 3\n  }\n}",
+            ),
+        ];
+
+        for (label, raw_output, flattened) in real_results {
+            for (surface, wire) in [
+                (
+                    "tool_call",
+                    serde_json::json!({
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call_x",
+                        "title": "bash",
+                        "kind": "execute",
+                        "status": "completed",
+                        "content": [{
+                            "type": "content",
+                            "content": {"type": "text", "text": flattened},
+                        }],
+                        "rawOutput": raw_output.clone(),
+                    }),
+                ),
+                (
+                    "tool_call_update",
+                    serde_json::json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call_x",
+                        "status": "completed",
+                        "content": [{
+                            "type": "content",
+                            "content": {"type": "text", "text": flattened},
+                        }],
+                        "rawOutput": raw_output.clone(),
+                    }),
+                ),
+            ] {
+                let mut cache = ToolCallOutputCache::default();
+                let mut cb = CodeBuddyLiveState::default();
+                let (content, _, _, _) =
+                    pi_emit(AgentType::Pi, &mut cache, &mut cb, wire).await;
+                assert_eq!(
+                    content.as_deref(),
+                    Some(flattened),
+                    "{label} is a real result, not pi's empty announcement ({surface})"
+                );
+            }
+        }
+
+        // The one shape that IS the announcement — and only in its exact form.
+        assert!(pi_result_is_empty_announcement(&serde_json::json!({
+            "content": []
+        })));
+        assert!(
+            pi_result_is_empty_announcement(&serde_json::json!({"content": [], "details": null})),
+            "an explicit null `details` is the same announcement"
+        );
+        assert!(
+            !pi_result_is_empty_announcement(&serde_json::json!({"content": [], "details": {}})),
+            "any other non-null member means pi is reporting something"
+        );
+        assert!(
+            !pi_result_is_empty_announcement(&serde_json::json!({
+                "content": [{"type": "text", "text": ""}]
+            })),
+            "a populated block array is not the announcement, empty text or not"
+        );
+        assert!(!pi_result_is_empty_announcement(&serde_json::json!({})));
+        assert!(!pi_result_is_empty_announcement(&serde_json::json!("text")));
+    }
+
+    /// With no `content` the envelope IS the result, so it must be unwrapped to
+    /// the same text the history parser produces — not dropped, and not shipped
+    /// as JSON.
+    #[tokio::test]
+    async fn pi_tool_result_envelope_unwrapped_when_content_absent() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_fb7",
+                "status": "completed",
+                "rawOutput": {"content": [{"type": "text", "text": "v24.14.0\n"}]},
+            }),
+        )
+        .await;
+        assert_eq!(raw_output.as_deref(), Some("v24.14.0\n"));
+
+        // An unrecognized shape keeps the generic stringified behavior rather
+        // than silently dropping output we have never seen on this wire.
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_other",
+                "status": "completed",
+                "rawOutput": {"details": {"exitCode": 0}},
+            }),
+        )
+        .await;
+        assert_eq!(raw_output.as_deref(), Some(r#"{"details":{"exitCode":0}}"#));
+    }
+
+    /// Contrast guard: the unwrap is pi-gated — `{"content":[…]}` is a generic
+    /// MCP shape, and another agent's identical `rawOutput` still stringifies.
+    #[tokio::test]
+    async fn non_pi_agents_keep_the_stringified_mcp_envelope() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::ClaudeCode,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "rawOutput": {"content": [{"type": "text", "text": "ok"}]},
+            }),
+        )
+        .await;
+        assert_eq!(
+            raw_output.as_deref(),
+            Some(r#"{"content":[{"text":"ok","type":"text"}]}"#),
+            "non-pi agents keep the existing json_value_to_text behavior"
+        );
+    }
+
+    // ---- #525: pi's lifecycle announcements ride the prose channel ----------
+
+    /// Wire-in / events-out for a pi `agent_message_chunk`, the counterpart of
+    /// `pi_emit` for the message channel. Returns EVERY event the update
+    /// produced, so a test can assert on "nothing at all" as easily as on a
+    /// specific event.
+    async fn pi_emit_chunk(agent_type: AgentType, wire: serde_json::Value) -> Vec<AcpEvent> {
+        let st = SessionState::new(
+            "conn-pi".to_string(),
+            agent_type,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let update: SessionUpdate =
+            serde_json::from_value(wire).expect("valid agent_message_chunk wire shape");
+
+        emit_conversation_update(
+            &state,
+            &emitter,
+            agent_type,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        let guard = state.read().await;
+        guard
+            .recent_events_after(0)
+            .map(|events| events.iter().map(|e| e.payload.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn pi_chunk(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        })
+    }
+
+    fn pi_notify_chunk(text: &str, level: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+            "_meta": {"piAcp": {"notify": {"level": level}}},
+        })
+    }
+
+    /// Every announcement pi-acp puts on the prose channel, classified. This is
+    /// the inventory the fix is built from — if pi-acp reworks its wording, this
+    /// is the test that says so.
+    #[test]
+    fn pi_chunk_route_classifies_every_pi_acp_announcement() {
+        let route = |text: &str| pi_message_chunk_route(AgentType::Pi, text, None);
+
+        // auto_retry_start, both shapes.
+        assert_eq!(
+            route("Retrying (attempt 1/3, waiting 2s)..."),
+            PiChunkRoute::Retrying {
+                attempt: Some(1),
+                max: Some(3),
+                delay_ms: Some(2000),
+            }
+        );
+        assert_eq!(
+            route("Retrying..."),
+            PiChunkRoute::Retrying {
+                attempt: None,
+                max: None,
+                delay_ms: None,
+            },
+            "pi-acp's shapeless fallback still opens the banner, just without counters"
+        );
+        // auto_retry_end + both compaction sentences + all three queue messages.
+        for text in [
+            "Retry finished, resuming.",
+            "Context nearing limit, running automatic compaction...",
+            "Automatic compaction finished; context was summarized to continue the session.",
+            "Queued message (position 2).",
+            "Starting queued message. (1 remaining)",
+            "Cleared queued prompts.",
+        ] {
+            assert_eq!(route(text), PiChunkRoute::Drop, "{text:?} must not be prose");
+        }
+    }
+
+    /// The notify marker is authoritative and level-independent: an extension's
+    /// message is arbitrary text, so nothing but `_meta` can identify it. This is
+    /// the exact frame from the issue screenshot.
+    #[test]
+    fn pi_extension_notify_is_dropped_by_marker_at_every_level() {
+        for level in ["info", "warning", "error"] {
+            let meta = serde_json::json!({"piAcp": {"notify": {"level": level}}});
+            let meta = meta.as_object().cloned().expect("object meta");
+            assert_eq!(
+                pi_message_chunk_route(
+                    AgentType::Pi,
+                    "Released pi-caffeinate (agent finished).",
+                    Some(&meta)
+                ),
+                PiChunkRoute::Drop,
+                "level {level}"
+            );
+            // …even when the extension's text reads exactly like an answer.
+            assert_eq!(
+                pi_message_chunk_route(AgentType::Pi, "是的，插件已加载。", Some(&meta)),
+                PiChunkRoute::Drop,
+                "the marker wins over the text, level {level}"
+            );
+        }
+    }
+
+    /// The far more dangerous direction: text that must survive. pi-acp's
+    /// slash-command replies and prelude ride the SAME channel, and the model
+    /// itself can say anything.
+    #[test]
+    fn pi_chunk_route_leaves_real_prose_and_command_replies_alone() {
+        for text in [
+            // The model's own words, including the reply from the screenshot.
+            "你好。有什么需要我帮你处理?",
+            "是的，OV（OpenViking）插件当前已正式加载并可用。",
+            // Slash-command output (pi-acp `handleCommand`): the user asked.
+            "Usage: /name <name>",
+            "Cleared queued prompts. Session exported: /tmp/x.md",
+            "Session: abc\nMessages: 12",
+            "Compaction completed.",
+            // A rare but real failure notice, deliberately kept (see fn doc).
+            "Pi input UI request is not supported in ACP yet; cancelling it.",
+            // Near-misses: same opening, not the announcement.
+            "Retrying the request by hand is also an option.",
+            "Retrying (attempt one of three)...",
+            "Queued message (position two).",
+            // A whole-chunk match means an embedded sentence is still prose.
+            "I will say: Retry finished, resuming. Then continue.",
+        ] {
+            assert_eq!(
+                pi_message_chunk_route(AgentType::Pi, text, None),
+                PiChunkRoute::Prose,
+                "{text:?} is the agent speaking"
+            );
+        }
+    }
+
+    /// Contrast guard: the classifier is pi-gated, so another agent that happens
+    /// to say one of these sentences — or that uses a `piAcp` meta key of its own
+    /// — keeps today's behavior.
+    #[test]
+    fn pi_chunk_route_is_inert_for_other_agents() {
+        let meta = serde_json::json!({"piAcp": {"notify": {"level": "info"}}});
+        let meta = meta.as_object().cloned().expect("object meta");
+        for agent in [
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::Grok,
+            // Same known limitation the rest of the pi bridge carries: pi-acp
+            // registered under a CUSTOM id is not `AgentType::Pi`, so it keeps
+            // the old behavior rather than an unnamespaced marker applying to
+            // arbitrary agents (see `pi_terminal_meta_marks_bash`).
+            AgentType::Custom("my-pi"),
+        ] {
+            for text in [
+                "Retry finished, resuming.",
+                "Retrying (attempt 1/3, waiting 2s)...",
+                "Cleared queued prompts.",
+            ] {
+                assert_eq!(
+                    pi_message_chunk_route(agent, text, Some(&meta)),
+                    PiChunkRoute::Prose,
+                    "{agent:?} must be unaffected by the pi bridge"
+                );
+            }
+        }
+    }
+
+    /// #525 proper: the caffeinate frame must produce NO event, so it can neither
+    /// paint a bubble of its own nor splice into the reply already on screen.
+    #[tokio::test]
+    async fn pi_notify_chunk_emits_nothing_at_all() {
+        let events = pi_emit_chunk(
+            AgentType::Pi,
+            pi_notify_chunk("Released pi-caffeinate (agent finished).", "info"),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "an extension notify must not reach any channel: {events:?}"
+        );
+    }
+
+    /// Retry leaves the transcript and lands on the shared banner, carrying pi's
+    /// own counters so the banner can render its localized line.
+    #[tokio::test]
+    async fn pi_retry_chunk_becomes_the_retry_banner_with_counters() {
+        let events =
+            pi_emit_chunk(AgentType::Pi, pi_chunk("Retrying (attempt 2/3, waiting 4s)...")).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::ContentDelta { .. })),
+            "the retry sentence must not reach the transcript: {events:?}"
+        );
+        let retrying = events
+            .iter()
+            .find_map(|e| match e {
+                AcpEvent::TurnRetrying {
+                    message,
+                    attempt,
+                    max_retries,
+                    retry_delay_ms,
+                    ..
+                } => Some((message.clone(), *attempt, *max_retries, *retry_delay_ms)),
+                _ => None,
+            })
+            .expect("a TurnRetrying event is emitted");
+        assert_eq!(retrying, (String::new(), Some(2), Some(3), Some(4000)));
+    }
+
+    /// The other half of the contract: ordinary pi prose is untouched.
+    #[tokio::test]
+    async fn pi_prose_chunk_still_emits_content_delta() {
+        let events = pi_emit_chunk(AgentType::Pi, pi_chunk("你好。有什么需要我帮你处理?")).await;
+        let text = events
+            .iter()
+            .find_map(|e| match e {
+                AcpEvent::ContentDelta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("prose still reaches the transcript");
+        assert_eq!(text, "你好。有什么需要我帮你处理?");
+    }
+
+    /// The invariant that keeps the renderer and the empty-turn diagnosis in
+    /// agreement: a chunk codeg does not render must not count as the agent
+    /// having produced output, or a status-only turn ends blank AND successful.
+    #[test]
+    fn pi_status_chunks_do_not_count_as_agent_output() {
+        let status: SessionUpdate = serde_json::from_value(pi_notify_chunk(
+            "Keeping computer awake (display-awake).",
+            "info",
+        ))
+        .expect("valid wire shape");
+        let retry: SessionUpdate =
+            serde_json::from_value(pi_chunk("Retrying (attempt 1/3, waiting 2s)..."))
+                .expect("valid wire shape");
+        let prose: SessionUpdate =
+            serde_json::from_value(pi_chunk("是的，插件已加载。")).expect("valid wire shape");
+
+        assert!(!is_agent_output_update(AgentType::Pi, &status));
+        assert!(!is_agent_output_update(AgentType::Pi, &retry));
+        assert!(is_agent_output_update(AgentType::Pi, &prose));
+        // Same frames, another agent: unchanged.
+        assert!(is_agent_output_update(AgentType::ClaudeCode, &status));
+        assert!(is_agent_output_update(AgentType::ClaudeCode, &retry));
+    }
+
+    /// The frames below are a VERBATIM capture from a real `pi-acp@0.0.33`,
+    /// driven against a stub `pi --mode rpc` via the supported `PI_ACP_PI_COMMAND`
+    /// override, so this test asserts against the wire rather than against my
+    /// reading of pi-acp's source.
+    ///
+    /// It pins the two properties the whole fix rests on:
+    ///
+    /// 1. `_meta.piAcp.notify.level` really does reach the client, so the notify
+    ///    rule has a structured handle and never has to guess from the text.
+    /// 2. Each announcement arrives as ONE COMPLETE chunk, while real prose
+    ///    arrives in fragments (`是的，` / `OV 插件` / `已加载。`) — which is what
+    ///    makes whole-string matching safe. A prose delta is a fragment of a
+    ///    sentence; it is not a whole sentence with terminal punctuation.
+    #[test]
+    fn pi_captured_wire_frames_route_as_expected() {
+        let captured = serde_json::json!([
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "Released pi-caffeinate (agent finished)."},
+             "_meta": {"piAcp": {"notify": {"level": "info"}}}},
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "Retrying (attempt 1/3, waiting 2s)..."}},
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "Retry finished, resuming."}},
+            {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "是的，"}},
+            {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "OV 插件"}},
+            {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "已加载。"}},
+        ]);
+
+        let routes: Vec<PiChunkRoute> = captured
+            .as_array()
+            .expect("captured frames")
+            .iter()
+            .map(|frame| {
+                let text = frame["content"]["text"].as_str().expect("text chunk");
+                let meta = frame.get("_meta").and_then(|m| m.as_object()).cloned();
+                pi_message_chunk_route(AgentType::Pi, text, meta.as_ref())
+            })
+            .collect();
+
+        assert_eq!(
+            routes,
+            vec![
+                PiChunkRoute::Drop,
+                PiChunkRoute::Retrying {
+                    attempt: Some(1),
+                    max: Some(3),
+                    delay_ms: Some(2000),
+                },
+                PiChunkRoute::Drop,
+                PiChunkRoute::Prose,
+                PiChunkRoute::Prose,
+                PiChunkRoute::Prose,
+            ],
+            "the reply survives whole; only pi-acp's announcements are taken out"
+        );
+    }
+
+    /// End to end: a turn whose ONLY chunks were pi status is diagnosed as
+    /// metadata-only, so it reports "sent only status updates and no reply"
+    /// instead of completing as a silent blank turn.
+    #[test]
+    fn pi_status_only_turn_diagnoses_as_metadata_only() {
+        let mut probe = TurnOutputProbe::new(0);
+        for wire in [
+            pi_notify_chunk("Keeping computer awake (display-awake).", "info"),
+            pi_chunk("Retrying (attempt 1/3, waiting 2s)..."),
+            pi_chunk("Retry finished, resuming."),
+        ] {
+            probe.note_update(
+                AgentType::Pi,
+                &serde_json::from_value(wire).expect("valid wire shape"),
+            );
+        }
+        assert!(!probe.saw_agent_output);
+        assert_eq!(diagnose_empty_turn(&probe), EmptyTurnCause::MetadataOnly);
+
+        // One line of real prose is all it takes to make the turn non-empty.
+        probe.note_update(
+            AgentType::Pi,
+            &serde_json::from_value(pi_chunk("是的，插件已加载。")).expect("valid wire shape"),
+        );
+        assert!(probe.saw_agent_output);
     }
 
     #[test]
